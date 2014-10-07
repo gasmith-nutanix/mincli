@@ -1,4 +1,4 @@
 mincli
 ======
 
-A minimal shell client with a websocket backend
+A minimal shell client with a websocket backend.

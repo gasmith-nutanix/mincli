@@ -1,0 +1,93 @@
+#!/bin/bash
+#
+# Copyright (c) 2014 Nutanix Inc. All rights reserved.
+#
+# Author: gasmith@nutanix.com
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+# of the Software, and to permit persons to whom the Software is furnished to do
+# so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+base=$(dirname $(readlink -f "$0"))
+
+usage="""usage: $0 [options] [acli command]
+
+Options:
+  -h  This help message.
+  -H  Acropolis websocket server host.
+  -n  Avoid DNS lookups.
+  -o  Output format ('normal', 'json', 'json-pretty').
+  -u  Acropolis websocket server URL (overrides -H).
+"""
+
+host=localhost
+url=
+use_dns=1
+json=0
+pretty=0
+
+while getopts "hH:no:u:" opt; do
+  case "$opt" in
+    h)
+      echo -e "$usage"
+      exit 0
+      ;;
+    H)
+      host=$OPTARG
+      ;;
+    n)
+      use_dns=0
+      ;;
+    o)
+      case $OPTARG in
+        normal)
+          ;;
+        json)
+          json=1
+          ;;
+        json-pretty)
+          json=1
+          pretty=1
+          ;;
+        *)
+          echo "Ignoring unknown output format: $OPTARG" >&2
+          ;;
+      esac
+      ;;
+    u)
+      url=$OPTARG
+      ;;
+    *)
+      echo -e "$usage" 1>&2
+      exit 1
+      ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [ -z "$url" ]; then
+  url="ws://${host}:2030/acli"
+fi
+
+flags=("--prompt" "<acropolis> ")
+flags+=("--keep_history" "--history_file" "~/.acli_history")
+flags+=("--url" "$url")
+flags+=("--server_options")
+flags+=("{\"use_dns\": ${use_dns}, \"json\": ${json}, \"pretty\": ${pretty}}")
+
+exec "${base}/mincli" "${flags[@]}" "$@"

@@ -1,0 +1,476 @@
+#!/usr/bin/env python
+#
+# Copyright (c) 2014 Nutanix Inc. All rights reserved.
+#
+# Author: gasmith@nutanix.com
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+# of the Software, and to permit persons to whom the Software is furnished to do
+# so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+try:
+  import env
+except ImportError:
+  pass
+
+import atexit
+import errno
+from functools import wraps
+import gflags
+import json
+import locale
+import os
+import re
+import readline
+import signal
+import socket
+import sys
+from threading import Event
+import unicodedata
+import websocket
+
+FLAGS = gflags.FLAGS
+
+gflags.DEFINE_string("url", None,
+                     "Websocket server URL")
+
+gflags.DEFINE_string("prompt", "<mincli>",
+                     "Prompt string")
+
+gflags.DEFINE_boolean("color_prompt", True,
+                      "Whether to colorize the prompt")
+
+gflags.DEFINE_boolean("enable_ctrl_r", False,
+                      "Enables the ctrl-r hotkey for history searching. "
+                      "If you enable this option, you must exit ctrl-r mode "
+                      "with ctrl-g, or strange things will happen.")
+
+gflags.DEFINE_boolean("keep_history", False,
+                      "Whether to log commands to a shell history file.")
+
+gflags.DEFINE_string("history_file", None,
+                     "The shell history file.")
+
+gflags.DEFINE_string("exit_commands", "exit,core.exit",
+                     "Comma-separated exit commands")
+
+gflags.DEFINE_string("server_options", "{}",
+                     "Server options in JSON format")
+
+gflags.DEFINE_boolean("debug", False,
+                      "Debug mode")
+
+# CSI escape codes
+CUU = lambda n=1: "\x1b[%uA" % (n,)
+CUD = lambda n=1: "\x1b[%uB" % (n,)
+EL = lambda n=0: "\x1b[%uK" % (n,)
+
+# Colors are used in prompts, and they confuse readline's column calculations
+# unless properly escaped with \x01 and \x02.
+def SGR(*n):
+  return "\x01\x1b[%sm\x02" % (";".join(map(str, n)),)
+
+# Colorization wrappers
+green = lambda s: "%s%s%s" % (SGR(32), s, SGR(0))
+
+# Localized output encoding
+_encoding = locale.getpreferredencoding()
+
+# Copied from shlex.quote() from Python-3.3 with modifications
+_find_unsafe = re.compile(r'\s').search
+
+def _quote(s):
+  """Return a shell-escaped version of the string *s*."""
+  if not s:
+      return "''"
+  if _find_unsafe(s) is None:
+      return s
+  # use single quotes, and put single quotes into double quotes
+  # the string $'b is then quoted as '$'"'"'b'
+  return "'" + s.replace("'", "'\"'\"'") + "'"
+
+def shlex_join(args):
+  return " ".join(map(_quote, args))
+
+def get_term_width():
+  try:
+    rows, columns = os.popen('stty size', 'r').read().split()
+    return int(columns)
+  except Exception as exc:
+    sys.stderr.write("Couldn't determine terminal width: %s" % (exc,))
+    return 80
+
+def debug_log_exception(func):
+  @wraps(func)
+  def wrapper(*args, **kwargs):
+    try:
+      return func(*args, **kwargs)
+    except:
+      import traceback
+      traceback.print_exc()
+      raise
+  return wrapper
+
+class DisconnectError(Exception):
+  pass
+
+def wrap_socket_io(func):
+  @wraps(func)
+  def wrapper(*args, **kwargs):
+    while True:
+      try:
+        return func(*args, **kwargs)
+      except socket.error as ex:
+        if ex.errno == errno.EINTR:
+          continue
+        if ex.errno == errno.EPIPE:
+          raise DisconnectError()
+        raise
+  return wrapper
+
+class Shell(object):
+  def __init__(self,
+               url,
+               prompt=green("<mincli> "),
+               history_file=None,
+               enable_ctrl_r=False,
+               exit_commands=("exit", "core.exit"),
+               server_opts=None,
+               debug=False):
+    self.prompt = prompt
+    self.url = url
+    self.history_file = history_file
+    self.enable_ctrl_r = enable_ctrl_r
+    self.exit_commands = exit_commands
+    self.server_opts = server_opts or {}
+    self.debug = debug or FLAGS.debug
+
+    if debug:
+      self._completer = debug_log_exception(self._completer)
+      self._display_matches = debug_log_exception(self._display_matches)
+
+    self._interactive = False
+    self._term_width = get_term_width()
+    self._connect()
+
+  def _connect(self):
+    """
+    Connects to the server.
+
+    Exits the process ungracefully on diconnect. Ungracefully because we may be
+    in the context of a readline callback hook, where SystemExit is ignored.
+    """
+    try:
+      self._ws = websocket.create_connection(self.url)
+    except socket.error as ex:
+      sys.stdout.write("Failed to connect to server: %s\n" % (ex,))
+      os._exit(2)
+    except websocket.WebSocketException as ex:
+      sys.stdout.write("Connection failed: %s\n" % (ex,))
+      os._exit(3)
+
+    self._ws.send = wrap_socket_io(self._ws.send)
+    self._ws.recv = wrap_socket_io(self._ws.recv)
+
+    try:
+      self._send_option("term_width", self._term_width)
+      for opt, val in self.server_opts.iteritems():
+        self._send_option(opt, val)
+      if self.debug:
+        self._send_option("debug", 1)
+    except DisconnectError:
+      sys.stdout.write("Server disconnected during handshake\n")
+      os._exit(2)
+
+  def _send_option(self, name, val):
+    """
+    Sends an OPTION command to the server and waits for a response.
+
+    Args:
+      name (ascii): Option name.
+      val (ascii): Option value.
+    Raises:
+      DisconnectError
+    """
+    self._ws.send("OPTION %s=%s" % (name, val))
+    self._display_output()
+
+  def invoke(self, args):
+    """
+    Sends an EXEC command to the server and waits for a response.
+
+    Exits the process gracefully on server disconnect.
+
+    Args:
+      args ([ str ]): Tokenized command line input.
+    """
+    try:
+      self._invoke(shlex_join([ arg.decode(_encoding) for arg in args ]))
+    except DisconnectError:
+      sys.stderr.write("Server disconnected\n")
+      sys.exit(2)
+
+  def _invoke(self, line):
+    """
+    Sends an EXEC command to the server and waits for a response.
+
+    Args:
+      line (unicode): Command line.
+    Raises:
+      DisconnectError
+    """
+    self._ws.send("EXEC %s" % (line.encode("utf8"),))
+    self._display_output()
+
+  def mainloop(self):
+    """
+    Runs an interactive input loop, reconnecting to the server as necessary.
+    """
+    # Additional state for interactive mode.
+    self._interactive = True
+    self._winch = Event()
+
+    # Setup tab completion.
+    readline.parse_and_bind("tab: complete")
+    readline.set_completer_delims("")
+    readline.set_completer(self._completer)
+    readline.set_completion_display_matches_hook(self._display_matches)
+
+    # Disable ctrl-r, since ctrl-c exits this mode in a strange way: it doesn't
+    # clear the line buffer, but it doesn't display the line buffer either.
+    # There doesn't seem to be a workaround, because the python readline
+    # interface exposes a limited subset of the readline API. Notably, ctrl-g
+    # still exits ctrl-r mode properly, so users can re-enable this behavior if
+    # they so choose.
+    if not self.enable_ctrl_r:
+      readline.parse_and_bind("ctrl-r: ")
+
+    # Magical help macro: Move to the beginning of the line, insert 'help ',
+    # and hit enter.
+    readline.parse_and_bind('ctrl-h: "\\C-ahelp \\C-m"')
+
+    # Load shell history, and register an exit hook to write back to it.
+    if self.history_file is not None:
+      path = os.path.expanduser(self.history_file)
+      try:
+        readline.read_history_file(path)
+      except IOError:
+        pass
+      atexit.register(readline.write_history_file, path)
+
+    # Setup a signal handler to update terminal width when it changes.
+    try:
+      signal.signal(signal.SIGWINCH, lambda *args: self._winch.set())
+    except Exception:
+      pass
+
+    while True:
+      # Always request fresh completions after moving to the next prompt.
+      self._reset_completer()
+
+      try:
+        line = raw_input(self.prompt).decode(_encoding).strip()
+        if not line:
+          continue
+      except KeyboardInterrupt:
+        print
+        continue
+      except EOFError:
+        print
+        break
+
+      if line in self.exit_commands:
+        break
+
+      try:
+        self._maybe_handle_winch()
+        self._invoke(line)
+      except DisconnectError:
+        sys.stderr.write("Server disconnected; reconnecting...\n")
+        self._connect()
+
+  def _maybe_handle_winch(self):
+    """
+    Deferred handling for WINCH signals. Sends the current terminal width to
+    the server.
+    """
+    if self._winch.is_set():
+      self._term_width = get_term_width()
+      self._send_option("term_width", self._term_width)
+      self._winch.clear()
+
+  def _iter_output(self):
+    """
+    Fetches and yields responses from the server until an empty datagram is
+    recieved.
+
+    Yields:
+      The line key (or "_") and content (unicode, unicode).
+    """
+    while True:
+      try:
+        msg = self._ws.recv()
+      except websocket.WebSocketConnectionClosedException:
+        raise DisconnectError()
+      if not msg:
+        return
+      try:
+        key, line = msg.decode("utf8").split(" ", 1)
+      except (ValueError, UnicodeDecodeError):
+        sys.stderr.write("Server protocol violation\n")
+        os._exit(4)
+      yield key, line
+
+  def _display_output(self):
+    """
+    Writes response data (if any) to stdout.
+
+    When in interactive mode, line keys are used to keep track of lines that
+    may need to be re-rendered. This mode of operation depends on the server
+    having a fairly accurate notion of terminal width, and respecting it.
+    """
+    line_keys = {}
+    line_num = 0
+    for key, line in self._iter_output():
+      if key == "_" or key not in line_keys:
+        if self._interactive:
+          line_keys[key] = line_num
+        line_num += 1
+        print(line.encode(_encoding))
+      else:
+        delta = line_num - line_keys[key]
+        sys.stdout.write(CUU(delta))
+        sys.stdout.write("\r%s%s\r" % (EL(), line.encode(_encoding)))
+        sys.stdout.write(CUD(delta))
+        sys.stdout.flush()
+
+  def _reset_completer(self):
+    """
+    Clears cached completions.
+    """
+    self._opts_context = None
+    self._opts_prefix = None
+    self._opts = []
+
+  def _get_completions(self, buf):
+    """
+    Sends a COMP command, and caches the resulting completion data.
+    """
+    self._reset_completer()
+    self._opts_context = buf
+    self._ws.send("COMP %s" % (buf,))
+    for _, line in self._iter_output():
+      if self._opts_prefix is None:
+        self._opts_prefix = line
+      else:
+        self._opts.append(self._opts_prefix + line)
+
+  def _completer(self, text, state):
+    """
+    Readline completion hook.
+    """
+    # Only do completion at the end of the line.
+    text = text.decode(_encoding)
+    buf = readline.get_line_buffer().decode(_encoding)
+    if not buf.endswith(text):
+      return
+
+    # Fetch new completions from the server if the line buffer has changed.
+    if self._opts_context != buf:
+      for attempt in xrange(2):
+        try:
+          self._get_completions(buf)
+          break
+        except DisconnectError:
+          if attempt == 1:
+            sys.stderr.write("Server disconnected\n")
+            os._exit(2)
+          self._connect()
+
+    # If there's nothing to complete, don't return an option. Otherwise,
+    # readline prints it without going through our display_matches hook.
+    if len(self._opts) == 1 and text == self._opts[0]:
+      return
+
+    try:
+      return self._opts[state].encode(_encoding)
+    except IndexError:
+      pass
+
+  def _display_matches(self, prefix, matches, longest):
+    """
+    Readline completion_display_matches hook.
+    """
+    try:
+      self._maybe_handle_winch()
+    except DisconnectError:
+      pass
+
+    # Decode and trim off the line prefix (which we don't want to display).
+    matches = [
+        match.decode(_encoding)[len(self._opts_prefix):]
+          for match in matches ]
+
+    # Normalize to composed-form codepoints to improve length calculation
+    # accuracy, somewhat. This is only a best-effort solution: it doesn't work
+    # for characters that lack a composed form, or for east-asian characters
+    # that have funky widths.
+    matches = [
+        unicodedata.normalize("NFC", match)
+          for match in matches ]
+
+    longest = max(map(len, matches))
+    col_width = longest + 2
+
+    total = len(matches)
+    num_cols = self._term_width / col_width
+    num_rows = (total + num_cols - 1) / num_cols
+
+    print
+    for row in xrange(num_rows):
+      for ii in xrange(row, total, num_rows):
+        sys.stdout.write(("%-*s" % (col_width, matches[ii])).encode(_encoding))
+      sys.stdout.write("\n")
+
+    sys.stdout.write("%s%s" % (self.prompt, readline.get_line_buffer()))
+    readline.redisplay()
+
+def main(args):
+  prompt = FLAGS.prompt.strip() + " "
+  if FLAGS.color_prompt:
+    prompt = green(prompt)
+
+  shell = Shell(
+      FLAGS.url,
+      prompt=prompt,
+      enable_ctrl_r=FLAGS.enable_ctrl_r,
+      history_file=(FLAGS.history_file if FLAGS.keep_history else None),
+      exit_commands=FLAGS.exit_commands.split(","),
+      server_opts=json.loads(FLAGS.server_options),
+      debug=FLAGS.debug)
+
+  if len(args) == 1:
+    shell.mainloop()
+  else:
+    shell.invoke(args[1:])
+
+if __name__ == "__main__":
+  import sys
+  args = FLAGS(sys.argv)
+  del sys.argv[1:]
+  sys.exit(main(args))
