@@ -33,15 +33,17 @@ Options:
   -n  Avoid DNS lookups.
   -o  Output format ('normal', 'json', 'json-pretty').
   -u  Acropolis websocket server URL (overrides -H).
+  -y  Replies to all interactive prompts with default values.
 """
 
 host=localhost
 url=
+assume_default=0
 use_dns=1
 json=0
 pretty=0
 
-while getopts "hH:no:u:" opt; do
+while getopts "hH:no:u:y" opt; do
   case "$opt" in
     h)
       echo -e "$usage"
@@ -72,6 +74,9 @@ while getopts "hH:no:u:" opt; do
     u)
       url=$OPTARG
       ;;
+    y)
+      assume_default=1
+      ;;
     *)
       echo -e "$usage" 1>&2
       exit 1
@@ -88,6 +93,6 @@ flags=("--prompt" "<acropolis> ")
 flags+=("--keep_history" "--history_file" "~/.acli_history")
 flags+=("--url" "$url")
 flags+=("--server_options")
-flags+=("{\"use_dns\": ${use_dns}, \"json\": ${json}, \"pretty\": ${pretty}}")
+flags+=("{\"use_dns\": ${use_dns}, \"json\": ${json}, \"pretty\": ${pretty}, \"assume_default\": ${assume_default}}")
 
 exec "${base}/mincli" "${flags[@]}" "$@"

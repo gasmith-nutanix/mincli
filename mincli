@@ -29,6 +29,7 @@ except ImportError:
   pass
 
 import atexit
+from contextlib import contextmanager
 import errno
 from functools import wraps
 import gflags
@@ -112,7 +113,7 @@ def get_term_width():
     rows, columns = os.popen('stty size', 'r').read().split()
     return int(columns)
   except Exception as exc:
-    sys.stderr.write("Couldn't determine terminal width: %s" % (exc,))
+    sys.stderr.write("Warning: Couldn't determine terminal width\n")
     return 80
 
 def debug_log_exception(func):
@@ -225,6 +226,24 @@ class Shell(object):
       sys.stderr.write("Server disconnected\n")
       sys.exit(2)
 
+  @contextmanager
+  def _readline_disabled(self):
+    """
+    Context manager to temporarily disable readline features in interactive mode.
+    """
+    if self._interactive:
+      orig_pos = readline.get_current_history_length()
+      readline.set_completer(lambda *args: None)
+      readline.set_completion_display_matches_hook(lambda *args: None)
+    try:
+      yield
+    finally:
+      if self._interactive:
+        while readline.get_current_history_length() > orig_pos:
+          readline.remove_history_item(orig_pos)
+        readline.set_completer(self._completer)
+        readline.set_completion_display_matches_hook(self._display_matches)
+
   def _invoke(self, line):
     """
     Sends an EXEC command to the server and waits for a response.
@@ -235,7 +254,20 @@ class Shell(object):
       DisconnectError
     """
     self._ws.send("EXEC %s" % (line.encode("utf8"),))
-    self._display_output()
+    prompt = self._display_output()
+    if prompt is None:
+      return
+
+    with self._readline_disabled():
+      while prompt is not None:
+        try:
+          line = raw_input(prompt).decode(_encoding).strip()
+        except (KeyboardInterrupt, EOFError):
+          prompt = ""
+          continue
+        self._maybe_handle_winch()
+        self._ws.send("REPLY %s" % (line.encode("utf8"),))
+        prompt = self._display_output()
 
   def mainloop(self):
     """
@@ -259,10 +291,6 @@ class Shell(object):
     # they so choose.
     if not self.enable_ctrl_r:
       readline.parse_and_bind("ctrl-r: ")
-
-    # Magical help macro: Move to the beginning of the line, insert 'help ',
-    # and hit enter.
-    readline.parse_and_bind('ctrl-h: "\\C-ahelp \\C-m"')
 
     # Load shell history, and register an exit hook to write back to it.
     if self.history_file is not None:
@@ -309,7 +337,7 @@ class Shell(object):
     Deferred handling for WINCH signals. Sends the current terminal width to
     the server.
     """
-    if self._winch.is_set():
+    if self._interactive and self._winch.is_set():
       self._term_width = get_term_width()
       self._send_option("term_width", self._term_width)
       self._winch.clear()
@@ -343,12 +371,18 @@ class Shell(object):
     When in interactive mode, line keys are used to keep track of lines that
     may need to be re-rendered. This mode of operation depends on the server
     having a fairly accurate notion of terminal width, and respecting it.
+
+    Returns:
+      A prompt string, or None.
     """
+    prompt = None
     line_keys = {}
     line_num = 0
     for key, line in self._iter_output():
-      if key == "_" or key not in line_keys:
-        if self._interactive:
+      if key == "?":
+        prompt = line
+      elif key not in line_keys:
+        if key != "_" and self._interactive:
           line_keys[key] = line_num
         line_num += 1
         print(line.encode(_encoding))
@@ -358,6 +392,7 @@ class Shell(object):
         sys.stdout.write("\r%s%s\r" % (EL(), line.encode(_encoding)))
         sys.stdout.write(CUD(delta))
         sys.stdout.flush()
+    return prompt
 
   def _reset_completer(self):
     """
@@ -433,6 +468,12 @@ class Shell(object):
     matches = [
         unicodedata.normalize("NFC", match)
           for match in matches ]
+
+    # We leverage the readline completer to display documentation to users for
+    # command line content that cannot be auto-completed. This documentation is
+    # embedded in a 2-tuple with an empty string, which prevents readline from
+    # auto-advancing, and which we do not want to display here.
+    matches = filter(None, matches)
 
     longest = max(map(len, matches))
     col_width = longest + 2
