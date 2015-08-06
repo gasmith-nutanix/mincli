@@ -492,6 +492,13 @@ class Shell(object):
     readline.redisplay()
 
 def main(args):
+  # The webocket module uses BaseException.message in various exception
+  # handlers, thereby causing ugly deprecation warnings. Disable these in
+  # non-debug mode.
+  if not FLAGS.debug:
+    import warnings
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+
   prompt = FLAGS.prompt.strip() + " "
   if FLAGS.color_prompt:
     prompt = green(prompt)
