@@ -67,7 +67,7 @@ gflags.DEFINE_boolean("keep_history", False,
 gflags.DEFINE_string("history_file", None,
                      "The shell history file.")
 
-gflags.DEFINE_string("exit_commands", "exit,core.exit",
+gflags.DEFINE_string("exit_commands", "exit,quit,core.exit",
                      "Comma-separated exit commands")
 
 gflags.DEFINE_string("server_options", "{}",
