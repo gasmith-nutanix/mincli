@@ -37,7 +37,6 @@ import json
 import locale
 import os
 import re
-import readline
 import signal
 import socket
 import sys
@@ -232,6 +231,7 @@ class Shell(object):
     Context manager to temporarily disable readline features in interactive mode.
     """
     if self._interactive:
+      import readline
       orig_pos = readline.get_current_history_length()
       readline.set_completer(lambda *args: None)
       readline.set_completion_display_matches_hook(lambda *args: None)
@@ -273,6 +273,8 @@ class Shell(object):
     """
     Runs an interactive input loop, reconnecting to the server as necessary.
     """
+    import readline
+
     # Additional state for interactive mode.
     self._interactive = True
     self._winch = Event()
@@ -419,6 +421,8 @@ class Shell(object):
     """
     Readline completion hook.
     """
+    import readline
+
     # Only do completion at the end of the line.
     text = text.decode(_encoding)
     buf = readline.get_line_buffer().decode(_encoding)
@@ -451,6 +455,7 @@ class Shell(object):
     """
     Readline completion_display_matches hook.
     """
+    import readline
     try:
       self._maybe_handle_winch()
     except DisconnectError:
