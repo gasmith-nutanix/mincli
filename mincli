@@ -479,7 +479,7 @@ class Shell(object):
     col_width = longest + 2
 
     total = len(matches)
-    num_cols = self._term_width / col_width
+    num_cols = (self._term_width / col_width) or 1
     num_rows = (total + num_cols - 1) / num_cols
 
     print
