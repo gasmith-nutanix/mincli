@@ -29,6 +29,7 @@ except ImportError:
   pass
 
 import atexit
+import base64
 from contextlib import contextmanager
 import errno
 from functools import wraps
@@ -39,6 +40,7 @@ import os
 import re
 import signal
 import socket
+import ssl
 import sys
 from threading import Event
 import unicodedata
@@ -62,6 +64,11 @@ gflags.DEFINE_boolean("enable_ctrl_r", False,
 
 gflags.DEFINE_boolean("keep_history", False,
                       "Whether to log commands to a shell history file.")
+
+# Authenticaton.
+gflags.DEFINE_string("auth", None,
+                     "Base64 encoded username:pasword string used to "
+                     "authenticate the websocket connection.")
 
 gflags.DEFINE_string("history_file", None,
                      "The shell history file.")
@@ -146,6 +153,7 @@ def wrap_socket_io(func):
 class Shell(object):
   def __init__(self,
                url,
+               auth=None,
                prompt=green("<mincli> "),
                history_file=None,
                enable_ctrl_r=False,
@@ -154,6 +162,7 @@ class Shell(object):
                debug=False):
     self.prompt = prompt
     self.url = url
+    self.auth = auth
     self.history_file = history_file
     self.enable_ctrl_r = enable_ctrl_r
     self.exit_commands = exit_commands
@@ -176,7 +185,10 @@ class Shell(object):
     in the context of a readline callback hook, where SystemExit is ignored.
     """
     try:
-      self._ws = websocket.create_connection(self.url)
+      header = [ "Authorization: Basic %s" % self.auth ] if self.auth else []
+      self._ws = websocket.create_connection(self.url,
+                                             header=header,
+                                             sslopt={"cert_reqs": ssl.CERT_NONE})
     except socket.error as ex:
       sys.stdout.write("Failed to connect to server: %s\n" % (ex,))
       os._exit(2)
@@ -509,7 +521,8 @@ def main(args):
     prompt = green(prompt)
 
   shell = Shell(
-      FLAGS.url,
+      url=FLAGS.url,
+      auth=FLAGS.auth,
       prompt=prompt,
       enable_ctrl_r=FLAGS.enable_ctrl_r,
       history_file=(FLAGS.history_file if FLAGS.keep_history else None),
