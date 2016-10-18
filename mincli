@@ -95,6 +95,9 @@ def SGR(*n):
 # Colorization wrappers
 green = lambda s: "%s%s%s" % (SGR(32), s, SGR(0))
 
+# Keys that need special processing.
+special_keys = ("%", "?")
+
 # Localized output encoding
 _encoding = locale.getpreferredencoding()
 
@@ -201,6 +204,7 @@ class Shell(object):
 
     try:
       self._send_option("term_width", self._term_width)
+      self._send_option("file_upload_supported", True)
       for opt, val in self.server_opts.iteritems():
         self._send_option(opt, val)
       if self.debug:
@@ -266,20 +270,39 @@ class Shell(object):
       DisconnectError
     """
     self._ws.send("EXEC %s" % (line.encode("utf8"),))
-    prompt = self._display_output()
-    if prompt is None:
+    key, value = self._display_output()
+
+    if not key:
       return
 
+    # Process special keys.
     with self._readline_disabled():
-      while prompt is not None:
-        try:
-          line = raw_input(prompt).decode(_encoding).strip()
-        except (KeyboardInterrupt, EOFError):
-          prompt = ""
+      while key is not None:
+        # File upload.
+        if key == "%":
+          file_path = value
+          try:
+            with open(file_path, "rb") as f:
+              file_data = f.read()
+              b64_encoded = base64.b64encode(file_data)
+              self._ws.send("FILE %s" % b64_encoded.encode("utf8"))
+          except Exception as ex:
+            msg = "ERROR %s %s" % (ex.errno, ex.strerror)
+            self._ws.send("%s" % (msg.encode("utf8")))
+        # Show prompt.
+        elif key == "?":
+          prompt = value
+          try:
+            line = raw_input(prompt).decode(_encoding).strip()
+          except (KeyboardInterrupt, EOFError):
+            prompt = ""
+            continue
+          self._maybe_handle_winch()
+          self._ws.send("REPLY %s" % (line.encode("utf8"),))
+        else:
+          # Unknown special key. Ignore.
           continue
-        self._maybe_handle_winch()
-        self._ws.send("REPLY %s" % (line.encode("utf8"),))
-        prompt = self._display_output()
+        key, value = self._display_output()
 
   def mainloop(self):
     """
@@ -387,14 +410,17 @@ class Shell(object):
     having a fairly accurate notion of terminal width, and respecting it.
 
     Returns:
-      A prompt string, or None.
+      (key, line) for special keys. Else (None, None)
     """
-    prompt = None
+    ret_key = None
+    ret_val = None
+
     line_keys = {}
     line_num = 0
     for key, line in self._iter_output():
-      if key == "?":
-        prompt = line
+      if key in special_keys:
+        ret_key = key
+        ret_val = line
       elif key not in line_keys:
         if key != "_" and self._interactive:
           line_keys[key] = line_num
@@ -406,7 +432,7 @@ class Shell(object):
         sys.stdout.write("\r%s%s\r" % (EL(), line.encode(_encoding)))
         sys.stdout.write(CUD(delta))
         sys.stdout.flush()
-    return prompt
+    return ret_key, ret_val
 
   def _reset_completer(self):
     """
